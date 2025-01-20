@@ -1,0 +1,116 @@
+import cv2
+import torch
+from ibm_watson import NaturalLanguageUnderstandingV1
+from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
+from ultralytics import YOLO
+from deep_translator import GoogleTranslator
+
+# Configurar o IBM Watson NLU
+authenticator = IAMAuthenticator('UKd159aKfpf-7028jIvsxFL0G8jxLd_M7-IyX0A41m9V')  # Substitua pela sua chave de API
+nlu = NaturalLanguageUnderstandingV1(
+    version='2022-03-10',
+    authenticator=authenticator
+)
+nlu.set_service_url('https://api.au-syd.natural-language-understanding.watson.cloud.ibm.com/instances/b050e8dd-7433-4d69-a657-8b333ed2749a')  # Substitua pela URL do seu serviço Watson
+
+# Função para obter a descrição detalhada do IBM Watson
+def obter_descricao_ibm(objeto_nome):
+    if not objeto_nome or len(objeto_nome.split()) < 2:
+        return "Descrição não disponível para este objeto."
+
+    response = nlu.analyze(
+        text=objeto_nome,
+        features={'keywords': {}, 'sentiment': {}, 'emotion': {}}
+    ).get_result()
+
+    # Retorna uma descrição geral baseada nas palavras-chave ou sentimentos extraídos
+    descricao = response.get('keywords', [])
+    if descricao:
+        descricao_texto = f"Palavras-chave: {', '.join([kw['text'] for kw in descricao])}"
+    else:
+        descricao_texto = "Nenhuma descrição encontrada."
+
+    return descricao_texto
+
+# Definir o dispositivo (GPU para o modelo, CPU para outras operações)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Usando dispositivo: {device}")
+
+# Carregar o modelo YOLOv5
+model = YOLO('yolov5s.pt').to(device)
+if device.type == "cuda":
+    model.half()  # Reduz precisão para melhorar desempenho em GPUs compatíveis
+
+# Inicializar o tradutor
+tradutor = GoogleTranslator(source='en', target='pt')
+
+# Iniciar captura da câmera
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FPS, 30)  # Definir FPS 
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Reduzir resolução para melhor desempenho
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+confidence_threshold = 0.6  # Ajustar para maior precisão
+
+def apply_nms(detections, iou_threshold=0.4):
+    """Aplica supressão de não-máximos (NMS) para remover detecções duplicadas."""
+    if len(detections.boxes) == 0:
+        return []
+    
+    boxes = detections.boxes.xyxy.cpu().numpy().astype(int).tolist()
+    scores = detections.boxes.conf.cpu().numpy().tolist()
+    
+    indices = cv2.dnn.NMSBoxes(boxes, scores, confidence_threshold, iou_threshold)
+    
+    if indices is not None and len(indices) > 0:
+        indices = indices.flatten().tolist()  # Converter corretamente
+        return [detections.boxes.data[i] for i in indices]
+    return []  # Retorna lista vazia se não houver detecções válidas
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break  # Sai do loop se não conseguir capturar um frame
+
+    # Redimensionar a imagem para 640x640 (para ser compatível com o modelo)
+    frame_resized = cv2.resize(frame, (640, 640))
+
+    # Normalizar os valores da imagem dividindo por 255.0
+    frame_resized = frame_resized / 255.0
+
+    # Enviar o frame para o dispositivo correto (CPU/GPU)
+    frame_tensor = torch.from_numpy(frame_resized).float().to(device)
+    frame_tensor = frame_tensor.permute(2, 0, 1).unsqueeze(0)  # Transformar em BCHW
+
+    # Processar a imagem para detectar objetos
+    results = model(frame_tensor, imgsz=640)  # Ajustado para 640x640 para equilibrar precisão e desempenho
+    detections = results[0]
+
+    # Aplicar NMS para reduzir detecções duplicadas
+    filtered_detections = apply_nms(detections)
+
+    for obj in filtered_detections:
+        x1, y1, x2, y2, score, class_id = obj.tolist()
+
+        if score > confidence_threshold:  # Considerar apenas detecções confiáveis
+            class_id = int(class_id)
+            nome_original = model.names[class_id]
+            nome_traduzido = tradutor.translate(nome_original)
+
+            # Obter a descrição detalhada usando o IBM Watson
+            descricao_objeto = obter_descricao_ibm(nome_original)
+
+            # Desenhar caixa e adicionar o nome traduzido e descrição
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            texto = f"{nome_traduzido} ({score:.2f})"
+            cv2.putText(frame, texto, (int(x1), int(y1) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(frame, descricao_objeto, (int(x1), int(y1) + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+    # Mostrar a imagem com as detecções
+    cv2.imshow('Reconhecimento de Objetos - YOLOv5', frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break  # Pressione 'q' para sair
+
+cap.release()
+cv2.destroyAllWindows()
